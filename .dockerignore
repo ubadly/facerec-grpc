@@ -1,0 +1,22 @@
+# Windows 编译产物（不参与 Docker 构建）
+server/build/
+server/*.tlog
+server/*.vcxproj*
+
+# 日志
+*.log
+
+# Go 客户端（C++ 镜像不需要）
+client/
+
+# 旧生成的 pb 文件（容器内会重新生成）
+server/facerec.pb.cc
+server/facerec.pb.h
+server/facerec.grpc.pb.cc
+server/facerec.grpc.pb.h
+
+# Windows 版 SDK（根目录下的 include/lib 是 Windows 版，不用）
+include/
+lib/
+example/
+docs/

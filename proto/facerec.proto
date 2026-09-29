@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+package facerec;
+
+option go_package = "facerec/facerec";
+
+service FaceRecognition {
+  rpc Extract(ExtractRequest) returns (ExtractResponse);
+  rpc Compare(CompareRequest) returns (CompareResponse);
+}
+
+message ImageData {
+  bytes data = 1;
+  int32 width = 2;
+  int32 height = 3;
+  int32 channels = 4;
+}
+
+message ExtractRequest {
+  ImageData image = 1;
+}
+
+message Face {
+  int32 x = 1;
+  int32 y = 2;
+  int32 width = 3;
+  int32 height = 4;
+  float score = 5;
+  repeated float feature = 6;
+}
+
+message ExtractResponse {
+  repeated Face faces = 1;
+}
+
+message CompareRequest {
+  repeated float feature1 = 1;
+  repeated float feature2 = 2;
+}
+
+message CompareResponse {
+  float similarity = 1;
+}

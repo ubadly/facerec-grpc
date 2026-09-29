@@ -1,0 +1,36 @@
+# ============================================================
+# 注意：model/（模型）与 seeta-linux/（SDK）是构建必需的二进制，
+# 已按需纳入版本管理，此处【不要】忽略它们。
+# ============================================================
+
+# ---- Go 编译产物 ----
+# 说明：client/facerec/ 是 protoc 生成的 pb 代码目录，必须保留，
+#       故这里只忽略编译生成的二进制文件名，勿写 "facerec" 通配。
+facerec-cli
+facerec-bin
+client/facerec-cli
+client/facerec-bin
+*.exe
+*.test
+*.out
+
+# ---- 运行时生成的数据文件（由客户端命令生成，不纳入版本管理）----
+# 底库（register 命令生成）
+face_db.json
+# 特征文件（extract 命令生成）
+feature.json
+feat.json
+
+# ---- 日志 ----
+*.log
+
+# ---- 编辑器 / IDE ----
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ---- 系统文件 ----
+.DS_Store
+Thumbs.db
