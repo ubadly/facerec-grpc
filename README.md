@@ -17,6 +17,7 @@
 - [安装步骤](#安装步骤)
 - [配置方法](#配置方法)
 - [启动与运行](#启动与运行)
+- [GPU 部署](#gpu-部署)
 - [命令使用说明](#命令使用说明)
 - [参数详细说明](#参数详细说明)
 - [gRPC 接口说明](#grpc-接口说明)
@@ -78,7 +79,7 @@
 
 ```bash
 # 1. 克隆项目（模型文件使用 Git LFS 托管，见下方“安装步骤”）
-git clone <仓库地址> facerec-grpc
+git clone https://github.com/ubadly/facerec-grpc facerec-grpc
 cd facerec-grpc
 
 # 2. 构建镜像（首次需数分钟）
@@ -113,7 +114,7 @@ sudo apt-get install -y git-lfs    # Ubuntu / Debian
 # brew install git-lfs             # macOS
 
 git lfs install                    # 初始化 LFS
-git clone <仓库地址> facerec-grpc    # 克隆仓库（会自动拉取 LFS 文件）
+git clone https://github.com/ubadly/facerec-grpc facerec-grpc    # 克隆仓库（会自动拉取 LFS 文件）
 cd facerec-grpc
 ```
 
@@ -238,6 +239,41 @@ go run . <command> [flags]      # 未编译
 ```bash
 ./facerec
 ```
+
+---
+
+## GPU 部署（可选）
+
+> 说明：以下内容仅提供 GPU 部署思路。由于本项目开发环境没有 GPU 设备，相关内容未经实际测试验证，具体细节请以 GPU 版 SDK 官方文档为准。
+
+服务端代码已支持 `--device gpu` / `--gpu-id` 参数，但当前仓库集成的 `seeta-linux/` 为 **CPU 版 SDK**，无法直接启用 GPU。如需 GPU 加速，需完成以下改造。
+
+### 1. 环境要求
+
+- NVIDIA GPU 及驱动（版本需匹配所选 CUDA 版本）
+- CUDA / cuDNN（与 GPU 版 SDK 匹配的版本）
+- [NVIDIA Container Toolkit](https://github.com/NVIDIA/nvidia-container-toolkit)（使 Docker 能访问宿主机 GPU）
+
+### 2. 替换为 GPU 版 SDK
+
+1. 用 **GPU 版 SeetaFace SDK** 替换 `seeta-linux/` 下的 CPU 版动态库（可从 [SeetaFace6OpenBinary](https://github.com/ViewFaceCore/SeetaFace6OpenBinary) 获取 GPU 版二进制）；
+2. 修改 `Dockerfile`：
+   - 基础镜像改用带 CUDA 的镜像（如 `nvidia/cuda`）；
+   - 编译与运行阶段改为链接 GPU 版引擎库，并在运行镜像中安装对应的 CUDA 运行时；
+   - 将 GPU 版 `.so` 拷贝到 `seeta/lib64`。
+
+### 3. 以 GPU 模式运行
+
+```bash
+docker run -d --name facerec --gpus all -p 50051:50051 \
+  facerec-grpc:gpu ./server --device gpu --gpu-id 0
+```
+
+- `--gpus all`：将宿主机全部 GPU 暴露给容器（也可用 `--gpus '"device=0"'` 指定单卡）；
+- `--device gpu --gpu-id 0`：让 SeetaFace 使用 GPU 推理，并选择 0 号显卡；
+- `--pool` 建议根据 GPU 并发能力设置，通常可小于 CPU 场景。
+
+> 注意：模型文件（`model/*.csta`）通常 CPU/GPU 通用，但具体以 GPU 版 SDK 说明为准。
 
 ---
 
