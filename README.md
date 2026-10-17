@@ -217,6 +217,8 @@ docker logs facerec       # 查看服务端日志
 docker logs -f facerec    # 持续跟踪日志
 ```
 
+服务端会在 stdout 输出详细日志（`docker logs` 直接可见），包括：启动配置、引擎池逐实例初始化耗时、监听地址与实际端口、健康检查启用状态；以及每次 `Extract`/`Compare` 请求的来源 `peer`、图像信息、引擎租借/人脸检测/特征点/特征提取各阶段耗时与总耗时、异常兜底与优雅关闭日志。日志时间默认按容器时区（UTC）输出，比北京时间慢 8 小时。
+
 ### 停止 / 重启 / 删除
 
 ```bash
@@ -465,6 +467,21 @@ service FaceRecognition {
 
 > 客户端 `ExtractBGR` 约定输入为 BGR888 三通道像素（SeetaFace 要求），`decode.go` 负责把 jpeg/png 解码为 BGR。
 
+### 健康检查（grpc.health.v1.Health）
+
+服务端已内置 gRPC 标准健康检查服务 `grpc.health.v1.Health`，用于轻量级探活（无需发送图片），服务启动后即返回 `SERVING`。
+
+```bash
+# grpc_health_probe 方式（返回码 0 表示健康）
+grpc_health_probe -addr=<host>:50051
+
+# grpcurl 方式
+grpcurl -plaintext <host>:50051 grpc.health.v1.Health/Check
+# 正常输出：{"status":"SERVING"}
+```
+
+主要用于区分「网络不通」与「服务未就绪」：若探活超时/拒绝，说明端口未放行或服务未监听；若返回 `SERVING` 而业务仍失败，则问题在客户端连接配置或推理超时。
+
 ---
 
 ## 分步教程
@@ -624,6 +641,29 @@ docker build -t facerec-grpc:latest .
 protoc -I proto --go_out=. --go-grpc_out=. proto/facerec.proto
 cd client && go build -o facerec .
 ```
+
+### Q10：后端调用报 `DeadlineExceeded` / `received context error while waiting for new LB policy update`
+
+**原因**：这是 gRPC 客户端侧错误，表示客户端在超时前未能建立到服务端的连接，请求大概率根本没到达服务端。通常是网络层问题（云安全组未放行端口、防火墙、端口映射错误），而非推理慢。
+
+**排查**：
+1. 先做健康探活（见上文「健康检查」）：
+   - `grpc_health_probe -addr=<host>:50051` 超时/拒绝 → 端口不通，检查安全组/防火墙/端口映射；
+   - 返回 `SERVING` → 服务正常，问题在客户端连接配置或推理超时。
+2. 查看 `docker logs -f facerec`：
+   - 停在「引擎池初始化」→ 模型加载卡住或授权校验失败；
+   - 显示「监听成功」但始终无「Extract 请求到达」→ 请求没进来，网络不通；
+   - 有「Extract 请求到达」→ 请求已到达，问题在处理耗时或客户端超时配置。
+
+### Q11：服务端日志都输出哪些内容
+
+服务端会在 stdout 输出详细日志（`docker logs` 直接可见），主要包括：
+
+- 启动配置、模型文件存在性检查、引擎池逐实例初始化耗时、监听地址与实际绑定端口、健康检查启用状态；
+- 每次 `Extract`/`Compare` 请求：来源 `peer`、图像尺寸/通道/字节数、引擎租借耗时、人脸检测耗时、特征点/特征提取耗时、总耗时；
+- SeetaFace 异常兜底日志，以及 `SIGINT`/`SIGTERM` 优雅关闭日志。
+
+> 注意：容器默认时区为 UTC，日志时间比北京时间慢 8 小时，对比业务日志时需 +8 小时（或为容器设置 `TZ=Asia/Shanghai`）。
 
 ---
 
