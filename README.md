@@ -142,6 +142,8 @@ Dockerfile 为多阶段构建：
 - **阶段一（build）**：基于 `ubuntu:24.04`，安装 `g++`、`protoc`、`libgrpc++-dev` 等编译工具，用容器内 protoc 重新生成 pb 代码，再编译 `server.cpp`，最后收集运行所需的最小动态库集合。
 - **阶段二（runtime）**：仅安装 `libgomp1`（SeetaFace 底层 TenniS 库的 OpenMP 运行时）和 `libgrpc++1.51t64`（gRPC 运行时，自动拉入 protobuf/absl 依赖），拷贝 `server`、动态库和 3 个模型。
 
+> **国内加速**：Dockerfile 已内置把 apt 源切换到阿里云镜像（`mirrors.aliyun.com`），`apt-get` 安装依赖不再走国际源。若拉取基础镜像 `ubuntu:24.04` 本身较慢，可给 Docker 配置国内 registry mirror（如 `docker.m.daocloud.io`），或将 `FROM` 改为对应镜像源的 `ubuntu:24.04`。
+
 ### 3. 构建 Go 客户端
 
 ```bash
@@ -153,6 +155,8 @@ go build -o facerec .
 构建产物为 `client/facerec` 可执行文件。
 
 > 也可以不编译，直接用 `go run . <command> ...` 运行。
+
+> **国内加速**：首次 `go mod download` 建议先设置 Go 模块代理：`go env -w GOPROXY=https://goproxy.cn,direct`。
 
 ---
 

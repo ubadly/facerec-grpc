@@ -1,6 +1,11 @@
 # ===== 阶段一：编译 gRPC 服务端 =====
 FROM ubuntu:24.04 AS build
 
+# 切换 apt 源到阿里云镜像，国内构建加速（如需换源，改下面这一行即可）
+RUN sed -i \
+    's@//archive.ubuntu.com/ubuntu/@//mirrors.aliyun.com/ubuntu/@g; s@//security.ubuntu.com/ubuntu/@//mirrors.aliyun.com/ubuntu/@g' \
+    /etc/apt/sources.list.d/ubuntu.sources
+
 # 安装编译工具链：g++ / protoc / grpc 插件 / grpc 与 protobuf 开发库
 # libgomp1 是 SeetaFace 底层 TenniS 库（libtennis.so）的 OpenMP 运行时依赖
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -50,6 +55,11 @@ RUN mkdir -p /build/runlibs && cp \
 
 # ===== 阶段二：精简运行镜像 =====
 FROM ubuntu:24.04
+
+# 切换 apt 源到阿里云镜像，国内构建加速
+RUN sed -i \
+    's@//archive.ubuntu.com/ubuntu/@//mirrors.aliyun.com/ubuntu/@g; s@//security.ubuntu.com/ubuntu/@//mirrors.aliyun.com/ubuntu/@g' \
+    /etc/apt/sources.list.d/ubuntu.sources
 
 # 运行所需运行时库：
 # - libgomp1: SeetaFace 底层 TenniS 库（libtennis.so）的 OpenMP 运行时
