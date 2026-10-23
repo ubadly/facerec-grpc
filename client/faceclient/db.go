@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"sync"
 )
 
 // Person 底库中的一个人。
@@ -61,6 +62,7 @@ type Match struct {
 }
 
 // Identify 在底库中找与 feat 最相似的人，返回按相似度降序的结果。
+// 逐人串行调用 Compare，底库较大时较慢；推荐用 IdentifyConcurrent。
 func (db *Database) Identify(c *Client, feat []float32) ([]Match, error) {
 	if len(db.Persons) == 0 {
 		return nil, fmt.Errorf("底库为空")
@@ -72,6 +74,60 @@ func (db *Database) Identify(c *Client, feat []float32) ([]Match, error) {
 			return nil, fmt.Errorf("比对 %s 失败: %w", p.Name, err)
 		}
 		matches = append(matches, Match{Name: p.Name, Similarity: sim})
+	}
+	sort.Slice(matches, func(i, j int) bool {
+		return matches[i].Similarity > matches[j].Similarity
+	})
+	return matches, nil
+}
+
+// IdentifyConcurrent 并发地在底库中检索，workers 为并发协程数。
+// Compare 在服务端是纯点积计算（不占推理引擎），因此并发调用能线性加速。
+func (db *Database) IdentifyConcurrent(c *Client, feat []float32, workers int) ([]Match, error) {
+	if len(db.Persons) == 0 {
+		return nil, fmt.Errorf("底库为空")
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > len(db.Persons) {
+		workers = len(db.Persons)
+	}
+
+	type result struct {
+		idx int
+		sim float32
+		err error
+	}
+	jobs := make(chan int)
+	results := make(chan result, len(db.Persons))
+
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				sim, err := c.Compare(feat, db.Persons[i].Feature)
+				results <- result{idx: i, sim: sim, err: err}
+			}
+		}()
+	}
+	go func() {
+		for i := range db.Persons {
+			jobs <- i
+		}
+		close(jobs)
+	}()
+	wg.Wait()
+	close(results)
+
+	matches := make([]Match, 0, len(db.Persons))
+	for r := range results {
+		if r.err != nil {
+			return nil, fmt.Errorf("比对 %s 失败: %w", db.Persons[r.idx].Name, r.err)
+		}
+		matches = append(matches, Match{Name: db.Persons[r.idx].Name, Similarity: r.sim})
 	}
 	sort.Slice(matches, func(i, j int) bool {
 		return matches[i].Similarity > matches[j].Similarity

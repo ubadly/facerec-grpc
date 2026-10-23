@@ -169,6 +169,7 @@ func cmdIdentify(args []string) {
 	dbPath := fs.String("db", "face_db.json", "底库文件路径")
 	img := fs.String("img", "", "待识别图片路径（必填）")
 	threshold := fs.Float64("threshold", 0.6, "判定阈值，相似度高于此值才判定匹配")
+	workers := fs.Int("workers", 8, "并发比对底库的协程数")
 	fs.Parse(args)
 
 	if *img == "" {
@@ -199,8 +200,8 @@ func cmdIdentify(args []string) {
 		log.Fatalf("提取特征失败: %v", err)
 	}
 
-	// 与底库所有人比对
-	matches, err := db.Identify(c, feat)
+	// 与底库所有人比对（并发调用，服务端 Compare 是纯计算，可水平扩展）
+	matches, err := db.IdentifyConcurrent(c, feat, *workers)
 	if err != nil {
 		log.Fatalf("识别失败: %v", err)
 	}
@@ -276,10 +277,14 @@ func cmdBench(args []string) {
 	img := fs.String("img", "", "测试图片路径（必填）")
 	concurrency := fs.Int("c", 10, "并发数")
 	total := fs.Int("n", 100, "总请求数")
+	warmup := fs.Int("warmup", 5, "预热请求数（不计入统计）")
 	fs.Parse(args)
 
 	if *img == "" {
 		log.Fatal("请用 -img 指定测试图片")
+	}
+	if *concurrency < 1 {
+		*concurrency = 1
 	}
 
 	c, err := faceclient.New(*addr)
@@ -298,7 +303,16 @@ func cmdBench(args []string) {
 		log.Fatalf("解码失败: %v", err)
 	}
 	fmt.Printf("测试图片: %s (%dx%d)\n", *img, w, h)
-	fmt.Printf("并发数=%d  总请求数=%d\n", *concurrency, *total)
+	fmt.Printf("并发数=%d  总请求数=%d  预热=%d\n", *concurrency, *total, *warmup)
+
+	// 预热：第一次请求会触发 TCP 建连、HTTP/2 握手、服务端引擎的首次调用
+	// （SeetaFace 内部有惰性初始化的算子）。不预热的话这些一次性开销会
+	// 混进 P99，测出来的数字不可比。
+	for i := 0; i < *warmup; i++ {
+		if _, err := c.ExtractBGR(bgr, w, h, 3); err != nil {
+			log.Fatalf("预热失败: %v", err)
+		}
+	}
 
 	latencies := make([]time.Duration, *total)
 	var okCount, failCount int64
@@ -317,24 +331,31 @@ func cmdBench(args []string) {
 				}
 				t0 := time.Now()
 				_, err := c.ExtractBGR(bgr, w, h, 3)
-				latencies[n] = time.Since(t0)
+				d := time.Since(t0)
 				if err != nil {
 					atomic.AddInt64(&failCount, 1)
-				} else {
-					atomic.AddInt64(&okCount, 1)
+					return
 				}
+				latencies[n] = d
+				atomic.AddInt64(&okCount, 1)
 			}
 		}()
 	}
 	wg.Wait()
 	elapsed := time.Since(start)
 
+	// 失败的请求延迟记为 0，排序后会把分位数拉低，必须先剔除
+	latencies = latencies[:okCount]
 	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
 
 	fmt.Println("\n===== 压测结果 =====")
 	fmt.Printf("总耗时: %v\n", elapsed)
 	fmt.Printf("成功: %d  失败: %d\n", okCount, failCount)
-	fmt.Printf("QPS: %.2f\n", float64(*total)/elapsed.Seconds())
+	if okCount == 0 {
+		fmt.Println("全部请求失败，无有效延迟数据")
+		return
+	}
+	fmt.Printf("QPS: %.2f\n", float64(okCount)/elapsed.Seconds())
 	fmt.Printf("平均延迟: %v\n", avg(latencies))
 	fmt.Printf("最小: %v  最大: %v\n", latencies[0], latencies[len(latencies)-1])
 	fmt.Printf("P50: %v\n", percentile(latencies, 50))

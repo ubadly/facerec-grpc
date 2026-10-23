@@ -14,6 +14,9 @@ import (
 const maxMsgSize = 64 * 1024 * 1024
 
 // Client 是人脸识别 gRPC 服务的封装。
+//
+// gRPC 的 ClientConn 是并发安全的，多个 goroutine 共享同一个 Client 即可，
+// 不需要为每个 goroutine 单独建连接——那样会重复握手、重复占用服务端连接。
 type Client struct {
 	conn *grpc.ClientConn
 	stub pb.FaceRecognitionClient
