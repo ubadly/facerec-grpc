@@ -82,4 +82,5 @@ EXPOSE 50051
 ENV LD_LIBRARY_PATH=/app/seeta/lib64
 
 # 默认 CPU 推理；需要 GPU 时改为：--device gpu --gpu-id 0
-CMD ["./server", "--addr", "0.0.0.0:50051", "--device", "cpu", "--pool", "6"]
+# 引擎池与每引擎线程数默认按容器可用 CPU 自动配置（见 server --help）
+CMD ["./server", "--addr", "0.0.0.0:50051", "--device", "cpu"]
