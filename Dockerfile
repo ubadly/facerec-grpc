@@ -64,10 +64,17 @@ RUN sed -i \
 # 运行所需运行时库：
 # - libgomp1: SeetaFace 底层 TenniS 库（libtennis.so）的 OpenMP 运行时
 # - libgrpc++1.51t64: gRPC 运行时（自动拉入 libgrpc29t64/libprotobuf32t64/libabsl）
+# - tzdata: 时区数据。Ubuntu 基础镜像不带 /usr/share/zoneinfo，
+#   缺了它容器内 localtime() 只能拿到 UTC，日志时间会比东八区慢 8 小时。
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libgomp1 \
         libgrpc++1.51t64 \
+        tzdata \
     && rm -rf /var/lib/apt/lists/*
+
+# 容器默认时区。服务端日志时间戳、以及 docker logs 之外的一切本地时间都取这个值。
+# 需要别的时区时用 -e TZ=Asia/Tokyo 覆盖
+ENV TZ=Asia/Shanghai
 
 WORKDIR /app
 

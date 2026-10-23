@@ -14,6 +14,7 @@
 #include <condition_variable>
 #include <csignal>
 #include <pthread.h>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -78,6 +79,39 @@ static long elapsed_ms(std::chrono::steady_clock::time_point start) {
       .count();
 }
 
+// 微秒转可读时长。小于 1ms 用 us 表示，避免出现 "0.0ms" 这种没有信息量的值。
+static std::string fmt_us(long us) {
+  if (us < 0) us = 0;
+  std::ostringstream os;
+  if (us < 1000) {
+    os << us << "us";
+  } else if (us < 1000000) {
+    os << std::fixed << std::setprecision(1) << (us / 1000.0) << "ms";
+  } else {
+    os << std::fixed << std::setprecision(2) << (us / 1000000.0) << "s";
+  }
+  return os.str();
+}
+
+// 进程当前常驻内存（KB）。用于启动后确认「引擎池 x 225MB」的实际开销，
+// 也便于对照 README 里的内存表判断 --pool 是否设得过大。
+static long rss_kb() {
+#if defined(__linux__)
+  std::ifstream f("/proc/self/status");
+  std::string key;
+  while (f >> key) {
+    if (key == "VmRSS:") {
+      long v = 0;
+      f >> v;
+      return v;
+    }
+    std::string rest;
+    std::getline(f, rest);
+  }
+#endif
+  return -1;
+}
+
 // 异步日志：请求线程只做一次入队（一把短锁 + 字符串），由单独的后台线程写 stdout。
 //
 // 直接在请求线程里加锁写 std::cout 时，所有请求线程会排在同一把锁上等 IO
@@ -85,6 +119,9 @@ static long elapsed_ms(std::chrono::steady_clock::time_point start) {
 // 改成异步后，日志开销与磁盘/管道速度解耦。
 //
 // 队列设上限：日志消费不过来时宁可丢弃并计数，也不让业务线程阻塞。
+//
+// 错误日志是例外：走 write_sync 直接落盘。进程随后可能 abort/被 kill，
+// 排在队列里的错误信息会一起丢掉，而错误恰恰是最需要留下的那一条。
 class AsyncLogger {
  public:
   static AsyncLogger& instance() {
@@ -102,6 +139,12 @@ class AsyncLogger {
       queue_.push_back(line);
     }
     cv_.notify_one();
+  }
+
+  // 同步写：跳过队列，立刻输出。只给 error 用（调用频率低，不怕阻塞）。
+  void write_sync(const std::string& line) {
+    std::lock_guard<std::mutex> lk(out_mu_);
+    std::cout << line << '\n' << std::flush;
   }
 
   // 停止并冲刷剩余日志（main 退出前调用）
@@ -145,12 +188,14 @@ class AsyncLogger {
         out += l;
         out += '\n';
       }
+      std::lock_guard<std::mutex> lk(out_mu_);
       std::cout << out << std::flush;
       batch.clear();
     }
   }
 
   static constexpr size_t kMaxQueue = 65536;
+  std::mutex out_mu_;  // 保护 std::cout：异步批写与 write_sync 可能同时发生
   std::mutex mu_;
   std::condition_variable cv_;
   std::deque<std::string> queue_;
@@ -164,7 +209,154 @@ static void log(const std::string& level, const std::string& msg) {
 }
 static void log_info(const std::string& msg) { log("info", msg); }
 static void log_warn(const std::string& msg) { log("warn", msg); }
-static void log_error(const std::string& msg) { log("error", msg); }
+// error 同步落盘：紧接着可能就是 abort/被 kill，排队中的错误会丢
+static void log_error(const std::string& msg) {
+  AsyncLogger::instance().write_sync("[" + now_str() + "][error] " + msg);
+}
+
+// 进程内的短标识。多个容器/实例的日志汇总到一起时，用来区分是谁打的。
+// 取 hostname（容器里是 container id 前 12 位），取不到就退化成 "node"。
+static const std::string& node_id() {
+  static const std::string id = [] {
+#if defined(__linux__) || defined(__APPLE__)
+    char buf[128] = {0};
+    if (gethostname(buf, sizeof(buf) - 1) == 0 && buf[0]) {
+      std::string h(buf);
+      if (h.size() > 12) h.resize(12);
+      return h;
+    }
+#endif
+    return std::string("node");
+  }();
+  return id;
+}
+
+// ---- 运行期统计 ----
+//
+// 每 --stats-interval 秒打一行汇总（默认 60s，0 = 关闭）。
+// 请求级日志适合排查单次问题；而「排队是不是整体在涨」「池有没有打满」
+// 这类趋势只能看汇总——逐条日志刷屏时反而看不出来。
+struct ServiceStats {
+  static constexpr int kBuckets = 13;
+  // 总耗时直方图的桶上界（ms），最后一桶是 >= 2000ms。
+  // 60~200ms 是这套模型最密集的区间（320~640px 单张人脸），分得细一点，
+  // 否则 P50 只能报成 "<=120ms" 这种量级，看不出优化有没有效果。
+  static constexpr int kBounds[kBuckets] = {10, 20,  30,  40,  60,  80, 100,
+                                            150, 200, 300, 500, 1000, 2000};
+
+  std::atomic<uint64_t> extract_ok{0};
+  std::atomic<uint64_t> extract_fail{0};
+  std::atomic<uint64_t> compare_ok{0};
+  std::atomic<uint64_t> compare_fail{0};
+  std::atomic<uint64_t> faces{0};
+  std::atomic<uint64_t> queue_us_sum{0};
+  std::atomic<uint64_t> detect_ms_sum{0};
+  std::atomic<uint64_t> infer_ms_sum{0};  // 特征点 + 识别
+  std::atomic<uint64_t> total_ms_sum{0};
+  std::atomic<uint64_t> busy_sum{0};      // 每次取引擎时的在用实例数之和
+  std::atomic<uint64_t> hist[kBuckets + 1];
+
+  ServiceStats() {
+    for (auto& h : hist) h.store(0);
+  }
+
+  void on_extract(long queue_us, long detect_ms, long infer_ms, long total_ms,
+                  int nfaces, int busy) {
+    extract_ok.fetch_add(1);
+    faces.fetch_add(nfaces);
+    queue_us_sum.fetch_add(queue_us > 0 ? queue_us : 0);
+    detect_ms_sum.fetch_add(detect_ms > 0 ? detect_ms : 0);
+    infer_ms_sum.fetch_add(infer_ms > 0 ? infer_ms : 0);
+    total_ms_sum.fetch_add(total_ms > 0 ? total_ms : 0);
+    busy_sum.fetch_add(busy > 0 ? busy : 0);
+    int i = 0;
+    while (i < kBuckets && total_ms >= kBounds[i]) ++i;
+    hist[i].fetch_add(1);
+  }
+
+  // 取快照并把累计值清零，返回可直接打印的一行
+  std::string take_snapshot_line(double seconds, int pool_size) {
+    const uint64_t ok = extract_ok.exchange(0);
+    const uint64_t fail = extract_fail.exchange(0);
+    const uint64_t cok = compare_ok.exchange(0);
+    const uint64_t cfail = compare_fail.exchange(0);
+    const uint64_t nf = faces.exchange(0);
+    const uint64_t q = queue_us_sum.exchange(0);
+    const uint64_t det = detect_ms_sum.exchange(0);
+    const uint64_t inf = infer_ms_sum.exchange(0);
+    const uint64_t tot = total_ms_sum.exchange(0);
+    const uint64_t busy = busy_sum.exchange(0);
+    uint64_t h[kBuckets + 1];
+    for (int i = 0; i <= kBuckets; ++i) h[i] = hist[i].exchange(0);
+
+    // 整段空闲就不打日志：服务闲一整天时每分钟刷一行全 0 只是噪声，
+    // 反而会淹掉真正需要看的告警。
+    if (ok == 0 && fail == 0 && cok == 0 && cfail == 0) return "";
+
+    std::ostringstream os;
+    os << "统计 Extract=" << ok << " 失败=" << fail << " 人脸=" << nf
+       << " Compare=" << cok << " 失败=" << cfail;
+    if (ok > 0) {
+      const double n = static_cast<double>(ok);
+      // seconds<=0 表示进程退出时的收尾快照，没有可靠的统计区间，不报 QPS
+      if (seconds > 0) {
+        os << " QPS=" << std::fixed << std::setprecision(1) << n / seconds;
+      }
+      os << " 均排队=" << fmt_us(static_cast<long>(q / ok))
+         << " 均检测=" << fmt_us(static_cast<long>(det * 1000 / ok))
+         << " 均识别=" << fmt_us(static_cast<long>(inf * 1000 / ok))
+         << " 均总耗时=" << fmt_us(static_cast<long>(tot * 1000 / ok))
+         << " " << pctl(h, ok, 50) << " " << pctl(h, ok, 95);
+      if (pool_size > 0) {
+        os << " 池占用=" << std::fixed << std::setprecision(2)
+           << static_cast<double>(busy) / n << "/" << pool_size;
+      }
+    }
+    return os.str();
+  }
+
+ private:
+  // 从直方图估分位数。桶内不知道具体分布，报桶下界，形如 P50<=60ms
+  static std::string pctl(const uint64_t* h, uint64_t total, int p) {
+    const uint64_t target = (total * p + 99) / 100;
+    uint64_t acc = 0;
+    for (int i = 0; i <= kBuckets; ++i) {
+      acc += h[i];
+      if (acc >= target) {
+        std::ostringstream os;
+        // 落到最后一桶说明超过表内最大值，只能报下界
+        const int bound = (i < kBuckets) ? kBounds[i] : kBounds[kBuckets - 1];
+        os << "P" << p << (i < kBuckets ? "<=" : ">=") << bound << "ms";
+        return os.str();
+      }
+    }
+    return "";
+  }
+};
+
+static ServiceStats g_stats;
+static std::atomic<bool> g_stats_stop{false};
+
+// 统计汇总线程。间隔取 1s 粒度轮询，这样关闭时能及时退出，不必等满一个周期。
+static void spawn_stats_thread(int interval_s, int pool_size) {
+  if (interval_s <= 0) return;
+  std::thread([interval_s, pool_size] {
+    using clock = std::chrono::steady_clock;
+    auto next = clock::now() + std::chrono::seconds(interval_s);
+    for (;;) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      if (g_stats_stop.load()) return;
+      auto now = clock::now();
+      if (now < next) continue;
+      const auto period = std::chrono::seconds(interval_s);
+      const double elapsed =
+          std::chrono::duration<double>(now - (next - period)).count();
+      next = now + std::chrono::seconds(interval_s);
+      std::string line = g_stats.take_snapshot_line(elapsed, pool_size);
+      if (!line.empty()) log_info(line);
+    }
+  }).detach();
+}
 
 static bool file_exists(const std::string& path) {
   std::ifstream f(path);
@@ -216,25 +408,30 @@ class EnginePool {
   // 租借一个引擎；返回的 Lease 析构时自动归还。
   class Lease {
    public:
-    Lease(EnginePool& pool, Engine* e, long wait_us)
-        : pool_(pool), engine_(e), wait_us_(wait_us) {}
+    Lease(EnginePool& pool, Engine* e, long wait_us, int busy)
+        : pool_(pool), engine_(e), wait_us_(wait_us), busy_(busy) {}
     ~Lease() {
       if (engine_) pool_.release(engine_);
     }
     Lease(const Lease&) = delete;
     Lease& operator=(const Lease&) = delete;
     Lease(Lease&& o) noexcept
-        : pool_(o.pool_), engine_(o.engine_), wait_us_(o.wait_us_) {
+        : pool_(o.pool_), engine_(o.engine_), wait_us_(o.wait_us_),
+          busy_(o.busy_) {
       o.engine_ = nullptr;
     }
     Engine* operator->() const { return engine_; }
     // 在空闲队列上等待的时间（微秒），即真正的排队耗时
     long wait_us() const { return wait_us_; }
+    // 拿到这个引擎时，池里同时在用的引擎数。等于池大小说明已经打满，
+    // 下个请求必然排队——这一项能从日志里直接看出容量瓶颈。
+    int busy() const { return busy_; }
 
    private:
     EnginePool& pool_;
     Engine* engine_;
     long wait_us_;
+    int busy_;
   };
 
   Lease acquire() {
@@ -246,7 +443,8 @@ class EnginePool {
     long wait_us = std::chrono::duration_cast<std::chrono::microseconds>(
                        std::chrono::steady_clock::now() - t)
                        .count();
-    return Lease(*this, e, wait_us);
+    const int busy = size_ - static_cast<int>(idle_.size());
+    return Lease(*this, e, wait_us, busy);
   }
 
   int size() const { return size_; }
@@ -288,15 +486,22 @@ class FaceRecognitionServiceImpl final : public FaceRecognition::Service {
 
     if (img.data().empty() || img.width() <= 0 || img.height() <= 0 ||
         img.channels() <= 0) {
-      log_error("Extract peer=" + peer + " 非法图像参数，拒绝请求");
+      g_stats.extract_fail.fetch_add(1);
+      log_error("Extract peer=" + peer + " 非法图像参数（" +
+                std::to_string(img.width()) + "x" + std::to_string(img.height()) +
+                "/" + std::to_string(img.channels()) + "ch 字节数=" +
+                std::to_string(img.data().size()) + "），拒绝请求");
       return Status(grpc::INVALID_ARGUMENT,
                     "invalid image: empty data or non-positive dimensions");
     }
 
     auto engine = pool_.acquire();
+    const long queue_us = engine.wait_us();
+    const int busy = engine.busy();
     if (log_enabled(2)) {
-      log_info("Extract peer=" + peer + " 排队等待引擎=" +
-               std::to_string(engine.wait_us() / 1000.0) + "ms");
+      log_info("Extract peer=" + peer + " 排队等待引擎=" + fmt_us(queue_us) +
+               " 池占用=" + std::to_string(busy) + "/" +
+               std::to_string(pool_.size()));
     }
 
     try {
@@ -308,6 +513,7 @@ class FaceRecognitionServiceImpl final : public FaceRecognition::Service {
       SeetaFaceInfoArray faces = engine->detector_.detect(s);
       long detect_ms = elapsed_ms(t_detect);
 
+      long infer_ms = 0;  // 特征点 + 识别，逐张累加
       int extracted = 0;
       for (int i = 0; i < faces.size; ++i) {
         SeetaFaceInfo& f = faces.data[i];
@@ -321,6 +527,7 @@ class FaceRecognitionServiceImpl final : public FaceRecognition::Service {
         std::vector<float> feat(engine->recognizer_.GetExtractFeatureSize());
         bool ok = engine->recognizer_.Extract(s, pts.data(), feat.data());
         long feat_ms = elapsed_ms(t_feat);
+        infer_ms += lm_ms + feat_ms;
 
         if (!ok) {
           log_warn("Extract peer=" + peer + " 第 " + std::to_string(i) +
@@ -339,27 +546,40 @@ class FaceRecognitionServiceImpl final : public FaceRecognition::Service {
 
         if (log_enabled(2)) {
           log_info("Extract peer=" + peer + " 第 " + std::to_string(i) +
-                   " 张人脸: 特征点=" + std::to_string(lm_ms) + "ms 特征提取=" +
+                   " 张人脸: 框=" + std::to_string(f.pos.width) + "x" +
+                   std::to_string(f.pos.height) + " 置信度=" +
+                   std::to_string(static_cast<int>(f.score * 100)) + "% 特征点=" +
+                   std::to_string(lm_ms) + "ms 特征提取=" +
                    std::to_string(feat_ms) + "ms 特征维度=" +
                    std::to_string(feat.size()));
         }
       }
 
-      // 一行摘要，适合 production 下观察延迟：拆开排队/检测/总耗时便于定位。
-      // level 0 时整条日志（含字符串拼接）都跳过，压测/高吞吐场景可不产生任何 IO。
+      const long total_ms = elapsed_ms(t0);
+      g_stats.on_extract(queue_us, detect_ms, infer_ms, total_ms, extracted,
+                         busy);
+
+      // 一行摘要，适合 production 下观察延迟。排队 + 检测 + 识别应当接近总耗时，
+      // 差值是 gRPC 收发、反序列化和日志自身的开销；没检出人脸时识别段为 0，
+      // 此时差值就是纯框架开销。池=a/b 表示拿引擎那一刻池里有 a 个在用、
+      // 共 b 个——a==b 说明已经打满，再加并发只会排队。
+      // level 0 时整条日志（含字符串拼接）都跳过，压测/高吞吐场景不产生 IO。
       if (log_enabled(1)) {
-        log_info("Extract peer=" + peer + " 图像=" + std::to_string(img.width()) +
-                 "x" + std::to_string(img.height()) + " 排队=" +
-                 std::to_string(engine.wait_us() / 1000.0) + "ms 检测=" +
-                 std::to_string(detect_ms) + "ms 输出特征=" +
-                 std::to_string(extracted) + " 个 总耗时=" +
-                 std::to_string(elapsed_ms(t0)) + "ms");
+        std::ostringstream os;
+        os << "Extract peer=" << peer << " 图像=" << img.width() << "x"
+           << img.height() << "/" << img.channels() << "ch 排队="
+           << fmt_us(queue_us) << " 检测=" << detect_ms << "ms 识别="
+           << infer_ms << "ms 人脸=" << extracted << " 池=" << busy << "/"
+           << pool_.size() << " 总耗时=" << total_ms << "ms";
+        log_info(os.str());
       }
       return Status::OK;
     } catch (const std::exception& e) {
+      g_stats.extract_fail.fetch_add(1);
       log_error("Extract peer=" + peer + " 异常: " + e.what());
       return Status(grpc::INTERNAL, std::string("seeta exception: ") + e.what());
     } catch (...) {
+      g_stats.extract_fail.fetch_add(1);
       log_error("Extract peer=" + peer + " 未知异常");
       return Status(grpc::INTERNAL, "unknown seeta exception");
     }
@@ -385,6 +605,7 @@ class FaceRecognitionServiceImpl final : public FaceRecognition::Service {
     const auto& f1 = req->feature1();
     const auto& f2 = req->feature2();
     if (f1.empty() || f1.size() != f2.size()) {
+      g_stats.compare_fail.fetch_add(1);
       log_error("Compare peer=" + peer + " 特征维度不匹配（f1=" +
                 std::to_string(f1.size()) + ", f2=" + std::to_string(f2.size()) +
                 "），拒绝请求");
@@ -393,6 +614,7 @@ class FaceRecognitionServiceImpl final : public FaceRecognition::Service {
 
     const float sim = dot_similarity(f1.data(), f2.data(), f1.size());
     resp->set_similarity(sim);
+    g_stats.compare_ok.fetch_add(1);
     if (log_enabled(2)) {
       log_info("Compare peer=" + peer + " 维度=" + std::to_string(f1.size()) +
                " 相似度=" + std::to_string(sim) + " 总耗时=" +
@@ -425,6 +647,7 @@ static SeetaDevice parse_device(const std::string& s) {
 struct CpuTopology {
   int logical = 1;   // 逻辑核（含超线程、含 cgroup 配额）
   int physical = 1;  // 物理核
+  int available = 1; // 进程实际可调度的 CPU 数（cpuset / 亲和性），自动配置按它算
 };
 
 static CpuTopology detect_cpu_topology() {
@@ -433,7 +656,26 @@ static CpuTopology detect_cpu_topology() {
   long n = sysconf(_SC_NPROCESSORS_ONLN);
   if (n > 0) t.logical = static_cast<int>(n);
 
-  // cgroup v2 / v1 的 CPU 配额可能小于 sysconf 报告的核数（容器被限流）
+  // 进程实际能调度到哪些 CPU：cpuset（sched_setaffinity）不会改
+  // sysconf(_SC_NPROCESSORS_ONLN)，也不会改 cgroup 的 cpu.max，所以必须
+  // 显式读亲和性掩码。踩过的坑：docker --cpuset-cpus 0-3 时容器里只有
+  // 2 个物理核，但 sysconf 仍报 12，自动配置算出 3x2=6 线程，实测吞吐
+  // 只有正确配置的 1/3。
+  cpu_set_t allowed;
+  CPU_ZERO(&allowed);
+  bool have_mask = sched_getaffinity(0, sizeof(allowed), &allowed) == 0;
+  auto cpu_allowed = [&](int i) -> bool {
+    return !have_mask || CPU_ISSET(i, &allowed);
+  };
+  int avail = 0;
+  if (have_mask) {
+    for (int i = 0; i < CPU_SETSIZE; ++i) {
+      if (CPU_ISSET(i, &allowed)) ++avail;
+    }
+  }
+  t.available = avail > 0 ? avail : t.logical;
+
+  // cgroup v2 / v1 的 CPU 配额可能小于亲和性掩码（容器被限流）
   auto read_int = [](const char* path) -> long {
     std::ifstream f(path);
     long v = -1;
@@ -463,15 +705,17 @@ static CpuTopology detect_cpu_topology() {
     return -1;
   };
   int quota = quota_cores();
-  if (quota > 0 && quota < t.logical) t.logical = quota;
+  if (quota > 0 && quota < t.available) t.available = quota;
 
   // 统计 /sys/devices/system/cpu/cpuN/topology/thread_siblings_list：
-  // 每个物理核对应一组超线程兄弟，物理核数 = 独立兄弟组数
+  // 每个物理核对应一组超线程兄弟，物理核数 = 独立兄弟组数。
+  // 只统计亲和性掩码内的 CPU，否则会把容器根本用不到的核算进来。
   int nproc = static_cast<int>(sysconf(_SC_NPROCESSORS_CONF));
   if (nproc <= 0) nproc = t.logical;
   int groups = 0;
   std::string seen;  // 已统计过的兄弟组首元素
   for (int i = 0; i < nproc; ++i) {
+    if (!cpu_allowed(i)) continue;
     std::string base = "/sys/devices/system/cpu/cpu" + std::to_string(i) +
                        "/topology/thread_siblings_list";
     std::ifstream f(base);
@@ -491,21 +735,22 @@ static CpuTopology detect_cpu_topology() {
       ++groups;
     }
   }
-  if (groups > 0) t.physical = std::min(groups, t.logical);
-  else t.physical = t.logical;
+  if (groups > 0) t.physical = std::min(groups, t.available);
+  else t.physical = t.available;
   // 离线（offline）的核不计入，这里用 std::max(1,..) 兜底
   if (t.physical < 1) t.physical = 1;
   if (t.logical < t.physical) t.logical = t.physical;
+  if (t.available < 1) t.available = 1;
 #else
   unsigned hc = std::thread::hardware_concurrency();
-  t.logical = t.physical = hc > 0 ? static_cast<int>(hc) : 1;
+  t.logical = t.physical = t.available = hc > 0 ? static_cast<int>(hc) : 1;
 #endif
   return t;
 }
 
-// 根据物理核数给出默认的 (引擎池大小, 每引擎线程数)。
+// 根据「可调度 CPU 数」和「物理核数」给出默认的 (引擎池大小, 每引擎线程数)。
 //
-// 实测单请求 P50（SeetaFace 默认给检测/识别各 4 线程，这是超配的根源）：
+// 实测单请求 P50（12 逻辑核 / 6 物理核的机器，检测 320px / 640px / 1280px）：
 //
 //   线程/引擎    320px    640px    1280px
 //      1         80ms    118ms    318ms
@@ -519,60 +764,71 @@ static CpuTopology detect_cpu_topology() {
 // 结论一：3-4 线程是单请求的饱和点，12 线程会慢 3~10 倍。
 // 结论二：收益递减明显——从 1 线程到 3 线程只快 2 倍，不是 3 倍。
 //         识别阶段基本只有 1.5~2 倍并行度（26ms 就到底了），小图检测也是。
-//         所以「每引擎 4 线程」在物理核不够时很浪费。
 //
-// 并发吞吐实测（640px，pool x threads 的所有组合）：
-//   1x1=8.3   2x1=14.2  4x1=18.6  6x1=18.3  8x1=17.7  (QPS)
-//   2x2=12.8  3x2=14.9  4x2=17.5  6x2=17.1
-//   1x4=11.7  2x4=15.7  3x4=1.7（严重退化）
-// 即：总线程数决定吞吐，最佳区间是「总线程 ≈ 物理核数」；
-//     同时每个引擎至少分到 2 线程，否则池内排队会很严重。
+// ---- 小机器上的坑（256px 检测耗时，单请求，多次取中位）----
+//   cpuset 可用 CPU 数    threads=1    threads=2
+//        1                  12ms         12ms
+//        2                   6ms         35ms
+//        3                   6ms         53ms
+//        4                   6ms         40~65ms
+//        5                   6ms          5ms
+//       12                   5ms          5ms
+// 即：可用 CPU <= 4 时，每引擎 2 线程会让检测慢 7~10 倍（识别阶段不受影响，
+// 始终 45~55ms）。libgomp 的 OMP_WAIT_POLICY / GOMP_SPINCOUNT /
+// OMP_PROC_BIND 都改不动它，因为真正并行的是 TenniS 自己的线程池
+// （ts_Workbench_set_computing_thread_number），不是 OpenMP。
 //
-// 每个引擎实例要复制一份模型（约 500MB），所以池上限取 8。
-// 不变式：pool x threads <= 物理核数。
-static void auto_tune(int physical_cores, int* pool, int* threads) {
+// 同一个 2 物理核机器（可用 4 CPU，256px，threads=1）的池大小对比：
+//   pool   内存      c=1        c=4            c=8
+//     1   311MB  14.8 QPS   14.7/268ms   14.8/539ms   <-- 并发再高吞吐也不涨
+//     2   536MB  14.6 QPS   27.6/142ms   26.7/294ms
+//     3   760MB  14.3 QPS   37.5/ 98ms   35.3/224ms
+//     4   948MB  14.2 QPS   41.3/ 92ms   41.9/188ms   <-- 当前默认
+// 单请求延迟与池大小无关（都是约 68ms），池大小只影响并发时的排队。
+// pool=1 时所有请求挤同一个引擎排队，这就是生产日志里排队 242ms 的来源。
+// 内存吃紧可以用 --pool 2：一半内存换约 2/3 吞吐。
+//
+// 可用 CPU >= 5 时总线程数决定吞吐，最佳区间是「总线程 ≈ 物理核数」，
+// pool x threads 的实测（640px）：4x1=18.6  6x1=18.3  3x2=14.9  4x2=17.5
+// 因此大机器上仍按「每引擎 2 线程、池大小 = 物理核/2」配置，内存更省，
+// 单请求延迟也更好（6 物理核：3x2 单并发 26.5 QPS，6x1 只有 16.7 QPS）。
+//
+// 注意 available_cpus 是「实际可调度 CPU 数」，没有任何 cpuset/cgroup 限制时
+// 它就等于 nproc。所以一台原生 2 物理核/4 逻辑核的机器（不跑容器也一样）
+// 会得到 4x1 + 约 950MB 常驻内存——这是刻意的，见上面的实测数据。
+//
+// 每个引擎实例要复制一份模型（约 225MB 常驻，进程基线约 310MB），池上限取 8。
+static void auto_tune(int available_cpus, int physical_cores, int* pool,
+                      int* threads) {
   const int kMaxPool = 8;
   const int kMaxThreads = 4;  // 超过 4 无收益，12 更是灾难
-  const int kMinThreads = 2;  // 每引擎至少 2 线程，否则单引擎太慢
 
-  if (physical_cores <= 1) {
+  if (available_cpus <= 1) {
     *pool = 1;
     *threads = 1;  // 单核机器加线程只会互相抢，直接串行
     return;
   }
 
-  if (physical_cores == 2) {
-    *pool = 1;
-    *threads = 2;
+  if (available_cpus <= 4) {
+    // 小机器：每引擎只给 1 线程，靠多实例撑并发。
+    // 线程数必须 <= 可用 CPU 数——2 线程在 4 CPU 上会让检测慢 10 倍。
+    // 代价是内存：4 核机器 4 个引擎约 950MB 常驻。内存吃紧可用 --pool 2。
+    *threads = 1;
+    *pool = available_cpus;
+    if (*pool > kMaxPool) *pool = kMaxPool;
     return;
   }
 
-  // 物理核 3：只够一个 3 线程引擎。若拆成 2 个引擎各 2 线程就是 4 线程超配，
-  // 反而触发下面要避免的争用，所以宁可单引擎略慢也不超配。
-  if (physical_cores == 3) {
-    *pool = 1;
-    *threads = 3;
-    return;
-  }
-
-  // 物理核 4：正好两个 2 线程引擎
-  if (physical_cores == 4) {
-    *pool = 2;
-    *threads = 2;
-    return;
-  }
-
-  // 物理核 >= 5：优先让每个引擎拿到 2 线程（收益最大的一段），
-  // 池大小 = 核数/2，多余核数再加到每个引擎上（封顶 4）
+  // 可用 CPU >= 5：每引擎 2 线程（收益最大的一段），池大小 = 物理核/2
   *threads = 2;
   *pool = physical_cores / 2;
+  if (*pool < 2) *pool = 2;  // 再小的机器也别退化成单引擎串行
   if (*pool > kMaxPool) {
     *pool = kMaxPool;
     *threads = physical_cores / kMaxPool;
   }
   if (*threads > kMaxThreads) *threads = kMaxThreads;
-  if (*threads < kMinThreads) *threads = kMinThreads;
-  if (*pool < 1) *pool = 1;
+  if (*threads < 1) *threads = 1;
 }
 
 static const char* device_name(SeetaDevice d) {
@@ -588,14 +844,18 @@ static void print_usage(const char* prog) {
             << "  --pool <N>                推理引擎实例数 (默认按 CPU 自动配置)\n"
             << "  --threads <N>             每引擎计算线程数, 1-4 (默认按 CPU 自动配置)\n"
             << "  --addr <ip:port>          监听地址 (默认 0.0.0.0:50051)\n"
-            << "  --log-level <N>           日志级别 0=摘要 1=正常 2=详细 (默认 1)\n"
+            << "  --log-level <N>           日志级别 0=仅启动/告警 1=每请求摘要 2=详细 (默认 1)\n"
+            << "  --stats-interval <N>      运行统计汇总间隔秒数, 0=关闭 (默认 60)\n"
             << "  --det <path>              人脸检测模型 (默认 model/face_detector.csta)\n"
             << "  --lm  <path>              特征点模型 (默认 model/face_landmarker_pts5.csta)\n"
             << "  --fr  <path>              人脸识别模型 (默认 model/face_recognizer.csta)\n"
-            << "\n自动配置原则：引擎池大小 x 每引擎线程数 <= 物理核数，\n"
-            << "二者相乘即同时运行的推理线程数，超过物理核数会因争用而变慢。\n"
+            << "\n自动配置原则：可调度 CPU <= 4 时按「1 线程 x N 个引擎」，\n"
+            << "否则按「2 线程 x (物理核/2) 个引擎」，总线程数 ≈ 物理核数。\n"
+            << "可调度 CPU 会同时考虑 cpuset(--cpuset-cpus) 与 cgroup 配额(--cpus)。\n"
+            << "小机器上别手动把 --threads 调到 2 以上，检测会慢 7~10 倍。\n"
             << "\n环境变量: SEETA_DEVICE(计算设备) SEETA_POOL(引擎池)\n"
             << "         SEETA_THREADS(每引擎线程数) SEETA_LOG_LEVEL(日志级别)\n"
+            << "         SEETA_STATS_INTERVAL(统计汇总间隔秒数, 0=关闭)\n"
             << "命令行参数优先级高于环境变量。\n";
 }
 
@@ -647,6 +907,7 @@ int main(int argc, char** argv) {
   int gpu_id = 0;
   int pool_size = 0;    // 0 = 未指定，稍后按 CPU 自动配置
   int threads = 0;      // 同上
+  int stats_interval = 60;  // 运行期统计汇总间隔（秒），0 = 关闭
 
   // 优先级: 命令行 > 环境变量 > 自动配置
   auto env_int = [](const char* name) -> int {
@@ -661,7 +922,14 @@ int main(int argc, char** argv) {
   };
   pool_size = env_int("SEETA_POOL");
   threads = env_int("SEETA_THREADS");
-  // 日志级别：SEETA_LOG_LEVEL 未设置时保持默认 1；显式设 0 表示只看摘要
+  if (const char* v = std::getenv("SEETA_STATS_INTERVAL")) {
+    if (*v) {
+      char* end = nullptr;
+      long n = std::strtol(v, &end, 10);
+      if (end != v && n >= 0) stats_interval = static_cast<int>(n);
+    }
+  }
+  // 日志级别：SEETA_LOG_LEVEL 未设置时保持默认 1；显式设 0 表示只留启动与告警
   g_log_level.store(1);
   if (const char* v = std::getenv("SEETA_LOG_LEVEL")) {
     if (*v) {
@@ -719,6 +987,10 @@ int main(int argc, char** argv) {
       fr_path = value_of(i);
     } else if (a.rfind("--fr=", 0) == 0) {
       fr_path = a.substr(5);
+    } else if (a == "--stats-interval") {
+      stats_interval = std::stoi(value_of(i));
+    } else if (a.rfind("--stats-interval=", 0) == 0) {
+      stats_interval = std::stoi(a.substr(17));
     } else {
       std::cerr << "未知参数: " << a << "\n";
       print_usage(argv[0]);
@@ -732,7 +1004,7 @@ int main(int argc, char** argv) {
   // ---- 自动配置 ----
   const CpuTopology cpu = detect_cpu_topology();
   int auto_pool = 0, auto_threads = 0;
-  auto_tune(cpu.physical, &auto_pool, &auto_threads);
+  auto_tune(cpu.available, cpu.physical, &auto_pool, &auto_threads);
   const bool pool_is_auto = pool_size <= 0;
   const bool threads_is_auto = threads <= 0;
   if (pool_is_auto) pool_size = auto_pool;
@@ -740,9 +1012,10 @@ int main(int argc, char** argv) {
   if (pool_size < 1) pool_size = 1;
   if (threads < 1) threads = 1;
 
-  log_info("==== facerec-grpc 服务端启动 ====");
+  log_info("==== facerec-grpc 服务端启动 [" + node_id() + "] ====");
   log_info("CPU 拓扑: 物理核=" + std::to_string(cpu.physical) + " 逻辑核=" +
-           std::to_string(cpu.logical) + "（已考虑容器 CPU 配额）");
+           std::to_string(cpu.logical) + " 可调度 CPU=" +
+           std::to_string(cpu.available) + "（取 sysconf/亲和性/cgroup 配额的最小值）");
   log_info("配置: 设备=" + std::string(device_name(dev)) + " 引擎池=" +
            std::to_string(pool_size) +
            (pool_is_auto ? "（自动）" : "（手动指定）") + " 每引擎线程数=" +
@@ -752,9 +1025,19 @@ int main(int argc, char** argv) {
            std::to_string(threads) + " = " +
            std::to_string(pool_size * threads) + " 线程 / " +
            std::to_string(cpu.physical) + " 物理核");
-  if (pool_size * threads > cpu.physical) {
+  // 小机器上每引擎多线程的代价远大于收益：可用 CPU <= 4 时 threads=2
+  // 会让检测慢 7~10 倍（见 auto_tune 的实测表）。这里显式警告手动配置踩坑。
+  // 注意小机器的池大小是按「可调度 CPU 数」配的（4 核就配 4 个引擎），
+  // 引擎数超过物理核数是刻意的：每引擎 1 线程，引擎之间是阻塞租借而非
+  // 自旋竞争，实测 4x1 在 2 物理核上 c=8 有 40 QPS，远超 1x2 的 9 QPS。
+  if (threads > 1 && cpu.available <= 4) {
+    log_warn("可调度 CPU 只有 " + std::to_string(cpu.available) +
+             " 个，每引擎 " + std::to_string(threads) +
+             " 线程会让检测慢 7~10 倍；建议 --threads 1 --pool " +
+             std::to_string(std::min(cpu.available, 8)));
+  } else if (pool_size * threads > cpu.available) {
     log_warn("推理线程数(" + std::to_string(pool_size * threads) +
-             ") 超过物理核数(" + std::to_string(cpu.physical) +
+             ") 超过可调度 CPU 数(" + std::to_string(cpu.available) +
              ")，并发下会因线程争用而变慢；建议减小 --pool 或 --threads");
   }
   log_info("模型路径: det=" + det_path + " lm=" + lm_path + " fr=" + fr_path);
@@ -802,11 +1085,27 @@ int main(int argc, char** argv) {
 
   log_info("监听成功: " + addr + "（实际绑定端口=" + std::to_string(selected_port) +
            "）");
+
+  const long rss = rss_kb();
+  log_info("日志级别=" + std::to_string(g_log_level.load()) +
+           (stats_interval > 0 ? " 统计汇总间隔=" +
+                                     std::to_string(stats_interval) + "s"
+                               : " 统计汇总已关闭") +
+           (rss > 0 ? " 常驻内存=" + std::to_string(rss / 1024) + "MB"
+                    : std::string()));
   log_info("服务就绪，等待客户端连接...");
 
+  spawn_stats_thread(stats_interval, pool_size);
   spawn_signal_thread();
 
   g_server->Wait();
+
+  // 关闭时把最后一个不完整周期的统计也打出来，避免丢失最后几十秒的数据
+  g_stats_stop.store(true);
+  {
+    std::string tail = g_stats.take_snapshot_line(0.0, pool_size);
+    if (!tail.empty()) log_info("退出前统计（本周期）: " + tail);
+  }
   log_info("服务已停止");
   AsyncLogger::instance().shutdown();  // 冲刷队列中剩余的日志
   return 0;
